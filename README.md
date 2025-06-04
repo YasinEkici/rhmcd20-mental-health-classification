@@ -18,14 +18,6 @@ Kullanılan veri seti "The RHMCD-20 datasets for Depression and Mental Health Da
 
 Veri setindeki birçok sütun "Yes/No/Maybe" veya kategorik aralıklarla (ör. "1-14 days," "More than 2 months") kodlanmıştır.
 
-## Elde Edilen Sonuçlar
-
-Projede Decision Tree modeli ile final hold-out testinde aşağıdaki sonuçlar elde edilmiştir:
-
-* **Accuracy:** %61
-* **ROC-AUC:** $\approx$0.68
-* **PR-AUC:** $\approx$0.68
-
 Model özellikle "Coping_Struggles" adlı hedef değişkeni ayırt etmede rastgele tahminden belirgin biçimde üstün çıkmıştır.
 
 ## Katkıda Bulunma
