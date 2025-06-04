@@ -28,21 +28,6 @@ Projede Decision Tree modeli ile final hold-out testinde aşağıdaki sonuçlar 
 
 Model özellikle "Coping_Struggles" adlı hedef değişkeni ayırt etmede rastgele tahminden belirgin biçimde üstün çıkmıştır.
 
-## Kurulum ve Çalıştırma
-
-Projenin çalıştırılması için gerekli adımlar ve bağımlılıklar burada belirtilecektir. Genellikle Python tabanlı projeler için aşağıdaki adımlar izlenebilir:
-
-1.  **Gerekli Kütüphaneleri Yükleme:**
-    ```bash
-    pip install pandas numpy scikit-learn matplotlib seaborn
-    ```
-2.  **Veri Setini İndirme:** (Eğer veri seti projeye dahil edilmemişse veya harici bir kaynaktan indirilecekse buraya link veya talimatlar eklenebilir.)
-3.  **Projenin Çalıştırılması:**
-    ```bash
-    python your_main_script.py
-    ```
-    (your_main_script.py yerine ana Python dosyanızın adını yazınız.)
-
 ## Katkıda Bulunma
 
 Bu projeye katkıda bulunmak isterseniz, lütfen bir `pull request` açmaktan çekinmeyin veya bir `issue` oluşturarak önerilerinizi paylaşın.
