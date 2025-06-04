@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+train_pipeline_strategyA_v3.py
+
+Strateji A (v3, düzeltilmiş):  
+  1) Veri Train/Validation/Test olarak bölünür (%60/%20/%20).  
+  2) Age, Days_Indoors, Mood_Swings, Growing_Stress gibi ordinal sütunlar önce binlenip,  
+     one-hot olacak şekilde kategorik hale getirilir.  
+  3) Quarantine_Frustrations, Growing_Stress, Mood_Swings, Weight_Change, Mental_Health_History  
+     sütunları üzerinden yeni oran ve etkileşim özellikleri üretilir.  
+  4) Geniş ancak makul hiperparametre ızgarasıyla (pruning, derinlik, yaprak) DecisionTreeClassifier  
+     eğitilip, validation ve test sonuçları raporlanır.  
+"""
+
+from pathlib import Path
+import pandas as pd
+import joblib
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.pipeline        import Pipeline
+from sklearn.preprocessing   import FunctionTransformer, OneHotEncoder
+from sklearn.compose         import ColumnTransformer
+from sklearn.model_selection import (
+    train_test_split,
+    KFold,
+    GridSearchCV,
+    cross_val_score
+)
+from sklearn.metrics         import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    average_precision_score,
+    RocCurveDisplay,
+    PrecisionRecallDisplay
+)
+from sklearn.tree            import DecisionTreeClassifier
+
+from preprocessing           import preprocess_data
+
+ROOT_DIR = Path(__file__).parents[1]
+RAW_PATH = ROOT_DIR / 'data' / 'raw' / 'mental_health_finaldata_1.csv'
+MODEL_DIR = ROOT_DIR / 'models'
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+def parcel_ordinal_bins(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ordinal sütunları (Age, Days_Indoors, Mood_Swings, Growing_Stress) 
+    önce kategorilere ayırıp boolean bayraklar (0/1) olarak ekler; Age için ayrı bir Age_Group sütunu oluşturur.
+    """
+    df2 = df.copy()
+
+    # — Age binning —
+    # Orijinal raw CSV’de muhtemelen Age şunlardan biriydi:
+    #   0 → "18-20", 1 → "21-25", 2 → "26-30", 3 → "30+"
+    # Burada numeric kodları direkt string label’a çeviriyoruz:
+    age_map = {0: '18_20', 1: '21_25', 2: '26_30', 3: '31_plus'}
+    df2['Age_Group'] = df2['Age'].map(age_map)
+
+    # — Days_Indoors binning —
+    # 
+    df2['Indoor_Low']  = (df2['Days_Indoors'] <= 1).astype(int)
+    df2['Indoor_Med']  = ((df2['Days_Indoors'] >= 2) & (df2['Days_Indoors'] <= 3)).astype(int)
+    df2['Indoor_High'] = (df2['Days_Indoors'] >= 4).astype(int)
+
+    # — Mood_Swings binning —
+    df2['Mood_Low']  = (df2['Mood_Swings'] <= 1).astype(int)
+    df2['Mood_Med']  = ((df2['Mood_Swings'] >= 2) & (df2['Mood_Swings'] <= 3)).astype(int)
+    df2['Mood_High'] = (df2['Mood_Swings'] >= 4).astype(int)
+
+    # — Growing_Stress binning —
+    df2['Stress_Low']  = (df2['Growing_Stress'] <= 1).astype(int)
+    df2['Stress_Med']  = ((df2['Growing_Stress'] >= 2) & (df2['Growing_Stress'] <= 3)).astype(int)
+    df2['Stress_High'] = (df2['Growing_Stress'] >= 4).astype(int)
+
+    return df2
+
+def add_more_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Oran ve etkileşim özellikleri ekler:
+      - Frustration_Stress_Ratio
+      - Mood_Days_Product
+      - Weight_Med_History_Ratio
+    """
+    df2 = df.copy()
+    df2['Frustration_Stress_Ratio'] = df2['Quarantine_Frustrations'] / (df2['Growing_Stress'] + 1)
+    df2['Mood_Days_Product']        = df2['Mood_Swings'] * df2['Days_Indoors']
+    df2['Weight_Med_History_Ratio'] = df2['Weight_Change'] / (df2['Mental_Health_History'] + 1)
+    return df2
+
+def build_preprocessing_pipeline():
+    """
+    Bu fonksiyon, Age_Group için one-hot işlemi uygulayan ColumnTransformer
+    oluşturur. Diğer sonradan eklenen boolean sütunlar ve oran/etkileşim sütunları
+    zaten DataFrame içinde hazır halde passthrough edilir.
+    """
+    onehot_age = Pipeline([
+        ('select_age', FunctionTransformer(lambda df: df[['Age_Group']], validate=False)),
+        ('oh',        OneHotEncoder(sparse_output=False))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('age_ohe', onehot_age, ['Age_Group']),
+        ],
+        remainder='passthrough'
+    )
+    return preprocessor
+
+def full_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    1) preprocess_data’dan gelen DataFrame’i alır.
+    2) parcel_ordinal_bins ile Age ve diğer ordinal sütunları binler.
+    3) add_more_features ile ek oran/etkileşim sütunları ekler.
+    4) build_preprocessing_pipeline ile Age_Group’un one-hot sürümünü oluşturur,
+       diğer tüm sütunları passthrough ederek nihai bir DataFrame elde eder.
+    """
+    # 1) Ordinal sütunlar için bin bayrakları
+    df_binned = parcel_ordinal_bins(df)
+
+    # 2) Yeni oran/etkileşim özellikleri
+    df_more = add_more_features(df_binned)
+
+    # 3) ColumnTransformer (Age_Group one-hot) uygular
+    preprocessor = build_preprocessing_pipeline()
+    transformed = preprocessor.fit_transform(df_more)
+
+    # ColumnTransformer çıktısının sütun adlarını belirleyelim:
+    age_ohe_categories = preprocessor.named_transformers_['age_ohe']\
+                             .named_steps['oh']\
+                             .get_feature_names_out(input_features=['Age_Group'])
+    # Diğer sütunlar remainder='passthrough' ile df_more içinde Age_Group hariç kalanların
+    # tam sıralamasıyla geliyor:
+    passthrough_cols = [c for c in df_more.columns if c != 'Age_Group']
+
+    # Sonuç DataFrame: önce Age one-hot sütunları, sonra diğer tüm sütunlar
+    df_final = pd.DataFrame(
+        np.hstack([transformed[:, : len(age_ohe_categories)], transformed[:, len(age_ohe_categories):]]),
+        columns=list(age_ohe_categories) + passthrough_cols,
+        index=df_more.index
+    )
+    return df_final
+
+def plot_roc_pr(y_true, y_prob, title_suffix=""):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    RocCurveDisplay.from_predictions(y_true, y_prob, ax=ax1)
+    ax1.set_title(f"ROC Curve {title_suffix}")
+    PrecisionRecallDisplay.from_predictions(y_true, y_prob, ax=ax2)
+    ax2.set_title(f"Precision-Recall Curve {title_suffix}")
+    plt.tight_layout()
+    plt.show()
+
+def evaluate_classification(y_true, y_pred):
+    print("=== Classification Report ===")
+    print(classification_report(y_true, y_pred))
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(4,4))
+    im = ax.matshow(cm, cmap=plt.cm.Blues)
+    fig.colorbar(im, ax=ax)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    ax.set_xticks([0,1])
+    ax.set_yticks([0,1])
+    ax.set_title("Confusion Matrix")
+    plt.show()
+
+def main():
+    # --- 1) Veri yükle ve preprocess_data (ordinal mapping + base one-hot + target encode) ---
+    df_raw  = pd.read_csv(RAW_PATH)
+    df_proc = preprocess_data(df_raw)  # categorical→one-hot, ordinal→code
+    X_all   = df_proc.drop('Coping_Struggles', axis=1)
+    y_all   = df_proc['Coping_Struggles']
+
+    # --- 2) Train/Validation/Test split (%60/%20/%20) ---
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X_all, y_all, test_size=0.20, stratify=y_all, random_state=42
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=0.25, stratify=y_trainval, random_state=42
+    )
+
+    print(f"Dataset dağılımı:")
+    print(f"  - Train    (total %): {len(X_train)}/{len(X_all)} = {len(X_train)/len(X_all):.2f}")
+    print(f"  - Val      (total %): {len(X_val)}/{len(X_all)} = {len(X_val)/len(X_all):.2f}")
+    print(f"  - Test     (total %): {len(X_test)}/{len(X_all)} = {len(X_test)/len(X_all):.2f}\n")
+
+    # --- 3) Pipeline tanımı: FE + DT sınıflayıcı ---
+    pipeline = Pipeline([
+        ('fe',  FunctionTransformer(full_feature_engineering, validate=False)),
+        ('clf', DecisionTreeClassifier(random_state=42, class_weight='balanced'))
+    ])
+
+    # --- 4) Hiperparametre ızgarası (v3) ---
+    param_grid = {
+        'clf__max_depth':        [None, 3, 5, 8],
+        'clf__min_samples_leaf': [1, 2, 5, 10],
+        'clf__min_samples_split':[2, 5, 10, 20],
+        'clf__criterion':        ['gini', 'entropy'],
+        'clf__ccp_alpha':        [0.0, 1e-5, 1e-4, 5e-4, 1e-3]
+    }
+
+    cv_inner = KFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=cv_inner,
+        scoring='roc_auc',
+        n_jobs=-1,
+        verbose=1
+    )
+
+    # --- 5) GridSearchCV (sadece X_train, y_train üzerinde) ---
+    print("🔧 GridSearchCV başlıyor (Training set üzerinde)...")
+    grid_search.fit(X_train, y_train)
+
+    print("\n📌 En iyi parametreler:")
+    print(grid_search.best_params_)
+    best_pipeline = grid_search.best_estimator_
+
+    # --- 6) Train‐CV skorları (en iyi modelle) ---
+    scores_acc  = cross_val_score(best_pipeline, X_train, y_train, cv=cv_inner, scoring='accuracy', n_jobs=-1)
+    scores_auc  = cross_val_score(best_pipeline, X_train, y_train, cv=cv_inner, scoring='roc_auc',    n_jobs=-1)
+    print(f"\n🔍 Train‐CV Acc skorları: {scores_acc}")
+    print(f"🔍 Ortalama Train‐CV Acc  : {scores_acc.mean():.4f}")
+    print(f"🔍 Train‐CV ROC-AUC skorları: {scores_auc}")
+    print(f"🔍 Ortalama Train‐CV ROC-AUC: {scores_auc.mean():.4f}\n")
+
+    # --- 7) Validation set üzerinde değerlendirme ---
+    print("=== Validation Set Performansı ===")
+    best_pipeline.fit(X_train, y_train)
+    y_val_pred = best_pipeline.predict(X_val)
+    y_val_prob = best_pipeline.predict_proba(X_val)[:, 1]
+
+    evaluate_classification(y_val, y_val_pred)
+    roc_val = roc_auc_score(y_val, y_val_prob)
+    pr_val  = average_precision_score(y_val, y_val_prob)
+    print(f"Val ROC-AUC: {roc_val:.3f}")
+    print(f"Val PR-AUC : {pr_val:.3f}")
+    plot_roc_pr(y_val, y_val_prob, title_suffix="(Validation Set)")
+
+    # --- 8) Final model: X_train+X_val birleşik set üzerinde fit ve test ---
+    print("\n🔄 Final eğitim: X_train+X_val birleşik set’i kullanıyoruz.")
+    X_trainval_all = pd.concat([X_train, X_val], axis=0)
+    y_trainval_all = pd.concat([y_train, y_val], axis=0)
+
+    final_pipeline = Pipeline([
+        ('fe',  FunctionTransformer(full_feature_engineering, validate=False)),
+        ('clf', DecisionTreeClassifier(
+            max_depth        = grid_search.best_params_['clf__max_depth'],
+            min_samples_leaf = grid_search.best_params_['clf__min_samples_leaf'],
+            min_samples_split= grid_search.best_params_['clf__min_samples_split'],
+            criterion        = grid_search.best_params_['clf__criterion'],
+            ccp_alpha        = grid_search.best_params_['clf__ccp_alpha'],
+            random_state=42,
+            class_weight='balanced'
+        ))
+    ])
+    final_pipeline.fit(X_trainval_all, y_trainval_all)
+
+    print("\n=== TEST SET Performansı ===")
+    y_test_pred = final_pipeline.predict(X_test)
+    y_test_prob = final_pipeline.predict_proba(X_test)[:, 1]
+
+    evaluate_classification(y_test, y_test_pred)
+    roc_test = roc_auc_score(y_test, y_test_prob)
+    pr_test  = average_precision_score(y_test, y_test_prob)
+    print(f"Test ROC-AUC: {roc_test:.3f}")
+    print(f"Test PR-AUC : {pr_test:.3f}")
+    plot_roc_pr(y_test, y_test_prob, title_suffix="(Test Set)")
+
+    # --- 9) Feature Importances ---
+    clf = final_pipeline.named_steps['clf']
+    fe_step = final_pipeline.named_steps['fe']
+    X_test_fe = fe_step.transform(X_test.copy())
+    feature_names = list(X_test_fe.columns)
+    importances = clf.feature_importances_
+    idxs = np.argsort(importances)[-10:]
+
+    plt.figure(figsize=(6, 4))
+    plt.barh([feature_names[i] for i in idxs], importances[idxs])
+    plt.title("Top 10 Feature Importances")
+    plt.xlabel("Importance")
+    plt.tight_layout()
+    plt.show()
+
+    # --- 10) Modeli kaydet ---
+    save_path = MODEL_DIR / 'decision_tree_stratA_v3.pkl'
+    joblib.dump(final_pipeline, save_path)
+    print(f"\n💾 Final pipeline (StratejiA_v3) kaydedildi: {save_path}")
+
+if __name__ == '__main__':
+    main()
